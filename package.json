@@ -10,7 +10,6 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
-    "better-sqlite3": "^11.8.1",
     "qrcode-terminal": "^0.12.0"
   }
 }
