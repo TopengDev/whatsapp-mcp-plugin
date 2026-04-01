@@ -1,7 +1,13 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
+  SubscribeRequestSchema,
+  UnsubscribeRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { execFile } from "child_process";
 import { loadConfig } from "./config.js";
 import { WhatsAppClient } from "./whatsapp.js";
@@ -19,9 +25,17 @@ function err(message: string) {
 async function main() {
   const config = loadConfig();
   const wa = new WhatsAppClient(config);
-  const server = new McpServer(
+
+  const mcp = new Server(
     { name: "whatsapp-mcp", version: "1.0.0" },
-    { capabilities: { resources: { subscribe: true, listChanged: true }, logging: {}, experimental: { "claude/channel": {} } } }
+    {
+      capabilities: {
+        tools: {},
+        resources: { subscribe: true, listChanged: true },
+        logging: {},
+        experimental: { "claude/channel": {} },
+      },
+    }
   );
 
   let lastQr: string | null = null;
@@ -30,13 +44,8 @@ async function main() {
   // ===== NOTIFICATION SYSTEM =====
   const NOTIFICATION_URI = "whatsapp://notifications";
   const recentNotifications: Array<{
-    id: string;
-    chat: string;
-    sender: string;
-    content: string;
-    timestamp: number;
-    time: string;
-    isGroup: boolean;
+    id: string; chat: string; sender: string; content: string;
+    timestamp: number; time: string; isGroup: boolean;
   }> = [];
   const MAX_NOTIFICATIONS = 50;
   const subscribedUris = new Set<string>();
@@ -44,26 +53,22 @@ async function main() {
   function playNotificationSound() {
     if (!config.notificationSound) return;
     execFile("paplay", [config.notificationSoundPath], (err) => {
-      if (err) {
-        execFile("aplay", ["-q", "/usr/share/sounds/alsa/Front_Center.wav"], () => {});
-      }
+      if (err) execFile("aplay", ["-q", "/usr/share/sounds/alsa/Front_Center.wav"], () => {});
     });
   }
 
   wa.onMessage((msg: StoredMessage) => {
-    // Skip protocol/system messages
     if (msg.message_type === "protocolMessage" || msg.message_type === "reactionMessage") return;
 
     const isGroup = msg.chat_jid.endsWith("@g.us");
     const sender = msg.sender_name || msg.sender_jid;
-
     const chatLabel = isGroup ? `[Group] ${msg.chat_jid}` : sender;
     const direction = msg.is_from_me ? "📤" : "💬";
     const content = msg.content || "[media]";
-
-    // Push to Claude Code terminal via channel notification (works when loaded as plugin)
     const displayUser = msg.is_from_me ? `You → ${chatLabel}` : sender;
-    server.server.notification({
+
+    // Channel notification — exactly like attn does it
+    mcp.notification({
       method: "notifications/claude/channel",
       params: {
         content: `${direction} ${msg.is_from_me ? "You → " + chatLabel : chatLabel}: ${content}`,
@@ -72,625 +77,217 @@ async function main() {
           ts: new Date(msg.timestamp * 1000).toISOString(),
         },
       },
-    }).catch(() => {});
+    }).catch((e: unknown) => {
+      process.stderr.write(`whatsapp: channel notification error: ${e}\n`);
+    });
 
     if (msg.is_from_me) return;
 
-    const notification = {
-      id: msg.id,
-      chat: msg.chat_jid,
-      sender,
-      content,
-      timestamp: msg.timestamp,
-      time: new Date(msg.timestamp * 1000).toISOString(),
-      isGroup,
-    };
+    recentNotifications.unshift({
+      id: msg.id, chat: msg.chat_jid, sender, content,
+      timestamp: msg.timestamp, time: new Date(msg.timestamp * 1000).toISOString(), isGroup,
+    });
+    if (recentNotifications.length > MAX_NOTIFICATIONS) recentNotifications.length = MAX_NOTIFICATIONS;
 
-    recentNotifications.unshift(notification);
-    if (recentNotifications.length > MAX_NOTIFICATIONS) {
-      recentNotifications.length = MAX_NOTIFICATIONS;
-    }
-
-    // Play sound
     playNotificationSound();
 
-    // Notify MCP subscribers
     if (subscribedUris.has(NOTIFICATION_URI)) {
-      server.server.sendResourceUpdated({ uri: NOTIFICATION_URI });
+      mcp.sendResourceUpdated({ uri: NOTIFICATION_URI });
     }
   });
 
-  wa.onQr((qr) => {
-    lastQr = qr;
+  wa.onQr((qr) => { lastQr = qr; });
+  wa.onConnection((status) => { connectionStatus = status; });
+
+  // ===== TOOL DEFINITIONS =====
+
+  const tools = [
+    // Status
+    { name: "connection_status", description: "Check WhatsApp connection status", inputSchema: { type: "object" as const, properties: {} } },
+    { name: "get_qr", description: "Get QR code for WhatsApp authentication", inputSchema: { type: "object" as const, properties: {} } },
+    // Messaging
+    { name: "send_message", description: "Send a text message to a phone number or contact name", inputSchema: { type: "object" as const, properties: { to: { type: "string", description: "Phone number or contact name" }, message: { type: "string", description: "Text message" } }, required: ["to", "message"] } },
+    { name: "send_media", description: "Send image/video/audio/document file", inputSchema: { type: "object" as const, properties: { to: { type: "string" }, file_path: { type: "string" }, type: { type: "string", enum: ["image", "video", "audio", "document"] }, caption: { type: "string" } }, required: ["to", "file_path", "type"] } },
+    { name: "send_location", description: "Send a GPS location", inputSchema: { type: "object" as const, properties: { to: { type: "string" }, latitude: { type: "number" }, longitude: { type: "number" }, name: { type: "string" } }, required: ["to", "latitude", "longitude"] } },
+    { name: "send_contact", description: "Share a contact card", inputSchema: { type: "object" as const, properties: { to: { type: "string" }, contact_name: { type: "string" }, contact_phone: { type: "string" } }, required: ["to", "contact_name", "contact_phone"] } },
+    { name: "reply_message", description: "Reply to a specific message by ID", inputSchema: { type: "object" as const, properties: { chat: { type: "string" }, message_id: { type: "string" }, message: { type: "string" } }, required: ["chat", "message_id", "message"] } },
+    { name: "forward_message", description: "Forward a message to another chat", inputSchema: { type: "object" as const, properties: { from_chat: { type: "string" }, message_id: { type: "string" }, to_chat: { type: "string" } }, required: ["from_chat", "message_id", "to_chat"] } },
+    { name: "delete_message", description: "Delete a sent message", inputSchema: { type: "object" as const, properties: { chat: { type: "string" }, message_id: { type: "string" } }, required: ["chat", "message_id"] } },
+    { name: "react_message", description: "React to a message with an emoji", inputSchema: { type: "object" as const, properties: { chat: { type: "string" }, message_id: { type: "string" }, emoji: { type: "string" } }, required: ["chat", "message_id", "emoji"] } },
+    // Reading
+    { name: "list_chats", description: "List all chats with last message preview", inputSchema: { type: "object" as const, properties: { limit: { type: "number" } } } },
+    { name: "read_messages", description: "Read messages from a specific chat", inputSchema: { type: "object" as const, properties: { chat: { type: "string" }, limit: { type: "number" }, offset: { type: "number" } }, required: ["chat"] } },
+    { name: "search_messages", description: "Search messages across chats", inputSchema: { type: "object" as const, properties: { query: { type: "string" }, chat: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
+    { name: "get_chat_info", description: "Get details about a chat", inputSchema: { type: "object" as const, properties: { chat: { type: "string" } }, required: ["chat"] } },
+    { name: "download_media", description: "Download media from a message", inputSchema: { type: "object" as const, properties: { chat: { type: "string" }, message_id: { type: "string" } }, required: ["chat", "message_id"] } },
+    // Contacts
+    { name: "list_contacts", description: "List all contacts", inputSchema: { type: "object" as const, properties: {} } },
+    { name: "get_contact", description: "Get contact details by phone", inputSchema: { type: "object" as const, properties: { phone: { type: "string" } }, required: ["phone"] } },
+    { name: "check_number", description: "Check if number is on WhatsApp", inputSchema: { type: "object" as const, properties: { phone: { type: "string" } }, required: ["phone"] } },
+    { name: "get_profile_picture", description: "Get profile picture URL", inputSchema: { type: "object" as const, properties: { contact: { type: "string" } }, required: ["contact"] } },
+    // Groups
+    { name: "list_groups", description: "List all groups", inputSchema: { type: "object" as const, properties: {} } },
+    { name: "get_group_info", description: "Get group details", inputSchema: { type: "object" as const, properties: { group_jid: { type: "string" } }, required: ["group_jid"] } },
+    { name: "create_group", description: "Create a new group", inputSchema: { type: "object" as const, properties: { name: { type: "string" }, members: { type: "array", items: { type: "string" } } }, required: ["name", "members"] } },
+    { name: "add_group_member", description: "Add members to a group", inputSchema: { type: "object" as const, properties: { group_jid: { type: "string" }, members: { type: "array", items: { type: "string" } } }, required: ["group_jid", "members"] } },
+    { name: "remove_group_member", description: "Remove members from a group", inputSchema: { type: "object" as const, properties: { group_jid: { type: "string" }, members: { type: "array", items: { type: "string" } } }, required: ["group_jid", "members"] } },
+    { name: "leave_group", description: "Leave a group", inputSchema: { type: "object" as const, properties: { group_jid: { type: "string" } }, required: ["group_jid"] } },
+    { name: "send_group_message", description: "Send message to a group", inputSchema: { type: "object" as const, properties: { group_jid: { type: "string" }, message: { type: "string" } }, required: ["group_jid", "message"] } },
+    // Notifications
+    { name: "get_notifications", description: "Get recent incoming message notifications", inputSchema: { type: "object" as const, properties: { limit: { type: "number" }, clear: { type: "boolean" } } } },
+    { name: "clear_notifications", description: "Clear all pending notifications", inputSchema: { type: "object" as const, properties: {} } },
+  ];
+
+  // ===== HANDLERS =====
+
+  mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+
+  mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args = {} } = request.params;
+    const a = args as any;
+
+    try {
+      switch (name) {
+        case "connection_status":
+          return ok({ connected: wa.isConnected(), status: connectionStatus, hasQr: !!lastQr });
+
+        case "get_qr": {
+          if (wa.isConnected()) return ok({ message: "Already connected." });
+          if (!lastQr) return ok({ message: "No QR code available yet." });
+          let asciiQr = "";
+          QRCode.generate(lastQr, { small: true }, (qr: string) => { asciiQr = qr; });
+          return ok({ qr_ascii: asciiQr, qr_raw: lastQr, instructions: "Scan with WhatsApp > Settings > Linked Devices > Link a Device" });
+        }
+
+        case "send_message": {
+          const result = await wa.sendMessage(a.to, a.message);
+          return ok({ sent: true, to: a.to, messageId: result?.key?.id, timestamp: result?.messageTimestamp });
+        }
+        case "send_media": {
+          const result = await wa.sendMedia(a.to, a.file_path, a.type, a.caption);
+          return ok({ sent: true, to: a.to, type: a.type, messageId: result?.key?.id });
+        }
+        case "send_location": {
+          const result = await wa.sendLocation(a.to, a.latitude, a.longitude, a.name);
+          return ok({ sent: true, to: a.to, messageId: result?.key?.id });
+        }
+        case "send_contact": {
+          const result = await wa.sendContact(a.to, a.contact_name, a.contact_phone);
+          return ok({ sent: true, to: a.to, contact: a.contact_name, messageId: result?.key?.id });
+        }
+        case "reply_message": {
+          const result = await wa.replyMessage(a.chat, a.message_id, a.message);
+          return ok({ sent: true, repliedTo: a.message_id, messageId: result?.key?.id });
+        }
+        case "forward_message": {
+          const result = await wa.forwardMessage(a.from_chat, a.message_id, a.to_chat);
+          return ok({ forwarded: true, from: a.from_chat, to: a.to_chat, messageId: result?.key?.id });
+        }
+        case "delete_message":
+          await wa.deleteMessage(a.chat, a.message_id);
+          return ok({ deleted: true, messageId: a.message_id });
+        case "react_message":
+          await wa.reactMessage(a.chat, a.message_id, a.emoji);
+          return ok({ reacted: true, messageId: a.message_id, emoji: a.emoji });
+
+        case "list_chats": {
+          const chats = await wa.listChats();
+          return ok(chats.slice(0, a.limit || 50));
+        }
+        case "read_messages": {
+          const msgs = wa.readMessages(a.chat, a.limit || 50, a.offset || 0);
+          return ok(msgs.map((m) => ({ id: m.id, sender: m.sender_name || m.sender_jid, content: m.content, type: m.message_type, timestamp: m.timestamp, time: new Date(m.timestamp * 1000).toISOString(), fromMe: m.is_from_me, quotedId: m.quoted_message_id, mediaType: m.media_type })));
+        }
+        case "search_messages": {
+          const msgs = wa.searchMessages(a.query, a.chat, a.limit || 50);
+          return ok(msgs.map((m) => ({ id: m.id, chat: m.chat_jid, sender: m.sender_name || m.sender_jid, content: m.content, timestamp: m.timestamp, time: new Date(m.timestamp * 1000).toISOString() })));
+        }
+        case "get_chat_info":
+          return ok(await wa.getChatInfo(a.chat));
+        case "download_media":
+          return ok({ downloaded: true, path: await wa.downloadMedia(a.chat, a.message_id) });
+
+        case "list_contacts":
+          return ok(wa.listContacts().map((c) => ({ jid: c.jid, name: c.name || c.notify_name || null, phone: c.phone })));
+        case "get_contact": {
+          const contact = wa.getContact(a.phone);
+          return contact ? ok({ found: true, ...contact }) : ok({ found: false, phone: a.phone });
+        }
+        case "check_number":
+          return ok(await wa.checkNumber(a.phone));
+        case "get_profile_picture":
+          return ok({ contact: a.contact, profilePictureUrl: await wa.getProfilePicture(a.contact) });
+
+        case "list_groups":
+          return ok(await wa.listGroups());
+        case "get_group_info": {
+          const info = await wa.getGroupInfo(a.group_jid);
+          return ok({ jid: info.id, subject: info.subject, description: info.desc, owner: info.owner, creation: info.creation, participants: info.participants.map((p) => ({ jid: p.id, admin: p.admin })) });
+        }
+        case "create_group":
+          return ok(await wa.createGroup(a.name, a.members));
+        case "add_group_member":
+          await wa.addGroupMember(a.group_jid, a.members);
+          return ok({ added: true, group: a.group_jid, members: a.members });
+        case "remove_group_member":
+          await wa.removeGroupMember(a.group_jid, a.members);
+          return ok({ removed: true, group: a.group_jid, members: a.members });
+        case "leave_group":
+          await wa.leaveGroup(a.group_jid);
+          return ok({ left: true, group: a.group_jid });
+        case "send_group_message": {
+          const result = await wa.sendGroupMessage(a.group_jid, a.message);
+          return ok({ sent: true, group: a.group_jid, messageId: result?.key?.id });
+        }
+
+        case "get_notifications": {
+          const results = recentNotifications.slice(0, a.limit || 20);
+          if (a.clear) recentNotifications.length = 0;
+          return ok({ count: results.length, notifications: results });
+        }
+        case "clear_notifications": {
+          const count = recentNotifications.length;
+          recentNotifications.length = 0;
+          return ok({ cleared: count });
+        }
+
+        default:
+          return err(`Unknown tool: ${name}`);
+      }
+    } catch (e) {
+      return err(String(e));
+    }
   });
 
-  wa.onConnection((status) => {
-    connectionStatus = status;
-  });
+  // Resources
+  mcp.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [{ uri: NOTIFICATION_URI, name: "notifications", title: "WhatsApp Notifications", description: "Real-time incoming message notifications", mimeType: "application/json" }],
+  }));
 
-  // ===== STATUS TOOLS =====
+  mcp.setRequestHandler(ReadResourceRequestSchema, async (request) => ({
+    contents: [{ uri: request.params.uri, mimeType: "application/json", text: JSON.stringify({ count: recentNotifications.length, notifications: recentNotifications }, null, 2) }],
+  }));
 
-  server.tool(
-    "connection_status",
-    "Check WhatsApp connection status",
-    {},
-    async () => {
-      return ok({
-        connected: wa.isConnected(),
-        status: connectionStatus,
-        hasQr: !!lastQr,
-      });
-    }
-  );
-
-  server.tool(
-    "get_qr",
-    "Get QR code for WhatsApp authentication. Returns ASCII art QR code to scan with your phone.",
-    {},
-    async () => {
-      if (wa.isConnected()) {
-        return ok({ message: "Already connected to WhatsApp. No QR needed." });
-      }
-
-      if (!lastQr) {
-        return ok({ message: "No QR code available yet. Connection may be initializing or already authenticated." });
-      }
-
-      // Generate ASCII QR
-      let asciiQr = "";
-      QRCode.generate(lastQr, { small: true }, (qr: string) => {
-        asciiQr = qr;
-      });
-
-      return ok({
-        qr_ascii: asciiQr,
-        qr_raw: lastQr,
-        instructions: "Scan this QR code with WhatsApp on your phone: Settings > Linked Devices > Link a Device",
-      });
-    }
-  );
-
-  // ===== MESSAGING TOOLS =====
-
-  server.tool(
-    "send_message",
-    "Send a text message to a phone number or contact name",
-    {
-      to: z.string().describe("Phone number (e.g., +628xxx, 08xxx) or contact name"),
-      message: z.string().describe("Text message to send"),
-    },
-    async ({ to, message }) => {
-      try {
-        const result = await wa.sendMessage(to, message);
-        return ok({
-          sent: true,
-          to,
-          messageId: result?.key?.id,
-          timestamp: result?.messageTimestamp,
-        });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "send_media",
-    "Send an image, video, audio, or document file",
-    {
-      to: z.string().describe("Phone number or contact name"),
-      file_path: z.string().describe("Absolute path to the media file"),
-      type: z.enum(["image", "video", "audio", "document"]).describe("Type of media"),
-      caption: z.string().optional().describe("Caption for the media"),
-    },
-    async ({ to, file_path, type, caption }) => {
-      try {
-        const result = await wa.sendMedia(to, file_path, type, caption);
-        return ok({ sent: true, to, type, messageId: result?.key?.id });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "send_location",
-    "Send a GPS location",
-    {
-      to: z.string().describe("Phone number or contact name"),
-      latitude: z.number().describe("Latitude"),
-      longitude: z.number().describe("Longitude"),
-      name: z.string().optional().describe("Location name/label"),
-    },
-    async ({ to, latitude, longitude, name }) => {
-      try {
-        const result = await wa.sendLocation(to, latitude, longitude, name);
-        return ok({ sent: true, to, messageId: result?.key?.id });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "send_contact",
-    "Share a contact card",
-    {
-      to: z.string().describe("Phone number or contact name to send the card to"),
-      contact_name: z.string().describe("Name of the contact to share"),
-      contact_phone: z.string().describe("Phone number of the contact to share"),
-    },
-    async ({ to, contact_name, contact_phone }) => {
-      try {
-        const result = await wa.sendContact(to, contact_name, contact_phone);
-        return ok({ sent: true, to, contact: contact_name, messageId: result?.key?.id });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "reply_message",
-    "Reply to a specific message by ID",
-    {
-      chat: z.string().describe("Chat JID, phone number, or contact name"),
-      message_id: z.string().describe("ID of the message to reply to"),
-      message: z.string().describe("Reply text"),
-    },
-    async ({ chat, message_id, message }) => {
-      try {
-        const result = await wa.replyMessage(chat, message_id, message);
-        return ok({ sent: true, repliedTo: message_id, messageId: result?.key?.id });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "forward_message",
-    "Forward a message to another chat",
-    {
-      from_chat: z.string().describe("Source chat JID, phone number, or contact name"),
-      message_id: z.string().describe("ID of the message to forward"),
-      to_chat: z.string().describe("Destination chat JID, phone number, or contact name"),
-    },
-    async ({ from_chat, message_id, to_chat }) => {
-      try {
-        const result = await wa.forwardMessage(from_chat, message_id, to_chat);
-        return ok({ forwarded: true, from: from_chat, to: to_chat, messageId: result?.key?.id });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "delete_message",
-    "Delete a sent message",
-    {
-      chat: z.string().describe("Chat JID, phone number, or contact name"),
-      message_id: z.string().describe("ID of the message to delete"),
-    },
-    async ({ chat, message_id }) => {
-      try {
-        await wa.deleteMessage(chat, message_id);
-        return ok({ deleted: true, messageId: message_id });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "react_message",
-    "React to a message with an emoji",
-    {
-      chat: z.string().describe("Chat JID, phone number, or contact name"),
-      message_id: z.string().describe("ID of the message to react to"),
-      emoji: z.string().describe("Emoji to react with (e.g., \ud83d\udc4d, \u2764\ufe0f, \ud83d\ude02)"),
-    },
-    async ({ chat, message_id, emoji }) => {
-      try {
-        await wa.reactMessage(chat, message_id, emoji);
-        return ok({ reacted: true, messageId: message_id, emoji });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  // ===== READING TOOLS =====
-
-  server.tool(
-    "list_chats",
-    "List all chats with last message preview and unread count",
-    {
-      limit: z.number().optional().describe("Max number of chats to return (default 50)"),
-    },
-    async ({ limit }) => {
-      try {
-        const chats = await wa.listChats();
-        return ok(chats.slice(0, limit || 50));
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "read_messages",
-    "Read messages from a specific chat",
-    {
-      chat: z.string().describe("Phone number, contact name, or chat JID"),
-      limit: z.number().optional().describe("Number of messages to return (default 50)"),
-      offset: z.number().optional().describe("Offset for pagination (default 0)"),
-    },
-    async ({ chat, limit, offset }) => {
-      try {
-        const messages = wa.readMessages(chat, limit || 50, offset || 0);
-        return ok(messages.map((m) => ({
-          id: m.id,
-          sender: m.sender_name || m.sender_jid,
-          content: m.content,
-          type: m.message_type,
-          timestamp: m.timestamp,
-          time: new Date(m.timestamp * 1000).toISOString(),
-          fromMe: m.is_from_me,
-          quotedId: m.quoted_message_id,
-          mediaType: m.media_type,
-        })));
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "search_messages",
-    "Search messages across all chats or within a specific chat",
-    {
-      query: z.string().describe("Text to search for"),
-      chat: z.string().optional().describe("Optional: limit search to this chat (phone number, name, or JID)"),
-      limit: z.number().optional().describe("Max results (default 50)"),
-    },
-    async ({ query, chat, limit }) => {
-      try {
-        const messages = wa.searchMessages(query, chat, limit || 50);
-        return ok(messages.map((m) => ({
-          id: m.id,
-          chat: m.chat_jid,
-          sender: m.sender_name || m.sender_jid,
-          content: m.content,
-          timestamp: m.timestamp,
-          time: new Date(m.timestamp * 1000).toISOString(),
-        })));
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "get_chat_info",
-    "Get details about a chat (contact info or group info)",
-    {
-      chat: z.string().describe("Phone number, contact name, or chat JID"),
-    },
-    async ({ chat }) => {
-      try {
-        const info = await wa.getChatInfo(chat);
-        return ok(info);
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "download_media",
-    "Download media from a received message to ~/Downloads/whatsapp-media/",
-    {
-      chat: z.string().describe("Chat JID, phone number, or contact name"),
-      message_id: z.string().describe("ID of the message containing media"),
-    },
-    async ({ chat, message_id }) => {
-      try {
-        const path = await wa.downloadMedia(chat, message_id);
-        return ok({ downloaded: true, path });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  // ===== CONTACT TOOLS =====
-
-  server.tool(
-    "list_contacts",
-    "List all saved contacts",
-    {},
-    async () => {
-      try {
-        const contacts = wa.listContacts();
-        return ok(contacts.map((c) => ({
-          jid: c.jid,
-          name: c.name || c.notify_name || null,
-          phone: c.phone,
-        })));
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "get_contact",
-    "Get contact details by phone number",
-    {
-      phone: z.string().describe("Phone number"),
-    },
-    async ({ phone }) => {
-      try {
-        const contact = wa.getContact(phone);
-        if (!contact) return ok({ found: false, phone });
-        return ok({ found: true, ...contact });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "check_number",
-    "Check if a phone number is registered on WhatsApp",
-    {
-      phone: z.string().describe("Phone number to check"),
-    },
-    async ({ phone }) => {
-      try {
-        const result = await wa.checkNumber(phone);
-        return ok(result);
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "get_profile_picture",
-    "Get a contact's profile picture URL",
-    {
-      contact: z.string().describe("Phone number, contact name, or JID"),
-    },
-    async ({ contact }) => {
-      try {
-        const url = await wa.getProfilePicture(contact);
-        return ok({ contact, profilePictureUrl: url });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  // ===== GROUP TOOLS =====
-
-  server.tool(
-    "list_groups",
-    "List all WhatsApp groups with member count",
-    {},
-    async () => {
-      try {
-        const groups = await wa.listGroups();
-        return ok(groups);
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "get_group_info",
-    "Get group details including members, admins, and description",
-    {
-      group_jid: z.string().describe("Group JID (ending in @g.us)"),
-    },
-    async ({ group_jid }) => {
-      try {
-        const info = await wa.getGroupInfo(group_jid);
-        return ok({
-          jid: info.id,
-          subject: info.subject,
-          description: info.desc,
-          owner: info.owner,
-          creation: info.creation,
-          participants: info.participants.map((p) => ({
-            jid: p.id,
-            admin: p.admin,
-          })),
-        });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "create_group",
-    "Create a new WhatsApp group",
-    {
-      name: z.string().describe("Group name"),
-      members: z.array(z.string()).describe("Array of phone numbers or contact names to add"),
-    },
-    async ({ name, members }) => {
-      try {
-        const result = await wa.createGroup(name, members);
-        return ok(result);
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "add_group_member",
-    "Add members to a group",
-    {
-      group_jid: z.string().describe("Group JID"),
-      members: z.array(z.string()).describe("Phone numbers or contact names to add"),
-    },
-    async ({ group_jid, members }) => {
-      try {
-        await wa.addGroupMember(group_jid, members);
-        return ok({ added: true, group: group_jid, members });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "remove_group_member",
-    "Remove members from a group",
-    {
-      group_jid: z.string().describe("Group JID"),
-      members: z.array(z.string()).describe("Phone numbers or contact names to remove"),
-    },
-    async ({ group_jid, members }) => {
-      try {
-        await wa.removeGroupMember(group_jid, members);
-        return ok({ removed: true, group: group_jid, members });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "leave_group",
-    "Leave a WhatsApp group",
-    {
-      group_jid: z.string().describe("Group JID"),
-    },
-    async ({ group_jid }) => {
-      try {
-        await wa.leaveGroup(group_jid);
-        return ok({ left: true, group: group_jid });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  server.tool(
-    "send_group_message",
-    "Send a message to a group",
-    {
-      group_jid: z.string().describe("Group JID (ending in @g.us)"),
-      message: z.string().describe("Text message to send"),
-    },
-    async ({ group_jid, message }) => {
-      try {
-        const result = await wa.sendGroupMessage(group_jid, message);
-        return ok({ sent: true, group: group_jid, messageId: result?.key?.id });
-      } catch (e) {
-        return err(String(e));
-      }
-    }
-  );
-
-  // ===== NOTIFICATION RESOURCE =====
-
-  server.registerResource(
-    "notifications",
-    NOTIFICATION_URI,
-    {
-      title: "WhatsApp Notifications",
-      description: "Real-time incoming WhatsApp message notifications. Subscribe to get notified when new messages arrive.",
-      mimeType: "application/json",
-    },
-    async (uri) => {
-      return {
-        contents: [{
-          uri: uri.toString(),
-          mimeType: "application/json",
-          text: JSON.stringify({
-            count: recentNotifications.length,
-            notifications: recentNotifications,
-          }, null, 2),
-        }],
-      };
-    }
-  );
-
-  // Handle subscribe/unsubscribe for resource notifications
-  server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+  mcp.setRequestHandler(SubscribeRequestSchema, async (request) => {
     subscribedUris.add(request.params.uri);
     return {};
   });
 
-  server.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+  mcp.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
     subscribedUris.delete(request.params.uri);
     return {};
   });
 
-  // ===== NOTIFICATION TOOL =====
-
-  server.tool(
-    "get_notifications",
-    "Get recent incoming message notifications. Returns new messages since last check.",
-    {
-      limit: z.number().optional().describe("Max notifications to return (default 20)"),
-      clear: z.boolean().optional().describe("Clear notifications after reading (default false)"),
-    },
-    async ({ limit, clear }) => {
-      const results = recentNotifications.slice(0, limit || 20);
-      if (clear) {
-        recentNotifications.length = 0;
-      }
-      return ok({
-        count: results.length,
-        notifications: results,
-      });
-    }
-  );
-
-  server.tool(
-    "clear_notifications",
-    "Clear all pending notifications",
-    {},
-    async () => {
-      const count = recentNotifications.length;
-      recentNotifications.length = 0;
-      return ok({ cleared: count });
-    }
-  );
-
-  // Connect transport
+  // Connect transport, then start WhatsApp
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await mcp.connect(transport);
 
-  // Start WhatsApp connection AFTER MCP transport is ready
   setTimeout(() => {
-    wa.connect().catch((e) => {
-      connectionStatus = `error: ${e.message}`;
-    });
+    wa.connect().catch((e) => { connectionStatus = `error: ${e.message}`; });
   }, 100);
 
-  // Graceful shutdown
-  process.on("SIGINT", async () => {
-    await wa.disconnect();
-    process.exit(0);
-  });
-
-  process.on("SIGTERM", async () => {
-    await wa.disconnect();
-    process.exit(0);
-  });
+  process.on("SIGINT", async () => { await wa.disconnect(); process.exit(0); });
+  process.on("SIGTERM", async () => { await wa.disconnect(); process.exit(0); });
 }
 
-main().catch((e) => {
-  console.error("Fatal error:", e);
-  process.exit(1);
-});
+main().catch((e) => { console.error("Fatal error:", e); process.exit(1); });
