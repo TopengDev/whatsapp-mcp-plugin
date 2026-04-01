@@ -1,0 +1,12 @@
+{
+  "name": "whatsapp",
+  "description": "WhatsApp messaging bridge for Claude Code — send, receive, and manage WhatsApp messages via Baileys.",
+  "version": "1.0.0",
+  "author": {
+    "name": "TopengDev",
+    "url": "https://github.com/TopengDev"
+  },
+  "repository": "https://github.com/TopengDev/whatsapp-mcp-plugin",
+  "license": "MIT",
+  "keywords": ["whatsapp", "messaging", "mcp", "channel", "baileys"]
+}
